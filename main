@@ -1,0 +1,438 @@
+#LIBS
+import os
+import random
+import time
+import datetime
+import copy
+import itertools
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn import metrics
+
+from efficientnet_pytorch import EfficientNet
+
+import torch
+from torch import nn, optim
+
+from torchvision import transforms, models, datasets
+from torchvision.datasets import ImageFolder
+
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# Inicialização das CNNs
+def Inicializacao_Modelo(model_type, num_output_classes):
+    modelo = None
+    tamanho = 0
+
+    if model_type == "alexnet":
+        # AlexNet
+        modelo = models.alexnet(pretrained=True)
+        num_ftrs = modelo.classifier[6].in_features
+        modelo.classifier[6] = nn.Linear(num_ftrs, num_output_classes)
+        tamanho = 224
+
+    elif model_type == "efficient":
+        # EfficientNet
+        modelo = EfficientNet.from_pretrained('efficientnet-b0')
+        num_ftrs = modelo._fc.in_features
+        modelo._fc = nn.Linear(num_ftrs, num_output_classes)
+        tamanho = 224
+
+    elif model_type == "resnet":
+        # ResNet50
+        modelo = models.resnet50(pretrained=True)
+        num_ftrs = modelo.fc.in_features
+        modelo.fc = nn.Linear(num_ftrs, num_output_classes)
+        tamanho = 224
+
+    else:
+        print("Invalid model type, exiting...")
+        exit()
+
+    return modelo, tamanho
+
+# Validação
+def validacao_modelo(model, dataloader, device):
+
+    true_labels = []
+    total_samples = 0
+    correct_predictions = 0
+    predicted_labels = []
+
+    model.eval()
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs.data, 1)
+
+            total_samples += labels.size(0)
+            correct_predictions += (predicted == labels).sum().item()
+
+            true_labels.extend(labels.tolist())
+            predicted_labels.extend(predicted.tolist())
+
+    return true_labels, predicted_labels
+
+# Parte 2
+def matriz_confusao(conf_matrix, classes, title='Confusion matrix', cmap=plt.cm.Blues):
+    plt.imshow(conf_matrix, interpolation='nearest', cmap=cmap)
+    plt.title(title)
+    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45)
+    plt.yticks(tick_marks, classes)
+
+    thresh = conf_matrix.max() / 2.
+    for i, j in itertools.product(range(conf_matrix.shape[0]), range(conf_matrix.shape[1])):
+        plt.text(j, i, conf_matrix[i, j],
+                 horizontalalignment="center",
+                 color="white" if conf_matrix[i, j] > thresh else "black")
+
+    plt.tight_layout()
+    plt.ylabel('Class')
+    plt.xlabel('Predicted Class')
+
+# Parte 3
+def matriz_perca_precisao(train_losses, val_losses, train_accuracies, val_accuracies, model_type, fold, save_dir):
+    epochs = len(train_losses)
+    x = range(1, epochs + 1)
+
+    plt.figure(figsize=(10, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(x, train_losses, c='red', ls='-', label='Train loss', fillstyle='none')
+    plt.plot(x, val_losses, c='blue', ls='--', label='Val. loss', fillstyle='none')
+    plt.title('Loss')
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(x, [acc.cpu() for acc in train_accuracies], c='red', ls='-', label='Train accuracy', fillstyle='none')
+    plt.plot(x, [acc.cpu() for acc in val_accuracies], c='blue', ls='--', label='Val. accuracy', fillstyle='none')
+    plt.title('Accuracy')
+    plt.legend()
+
+    plt.savefig(f'{save_dir}/{model_type}_fold{fold}_loss_acc.pdf')
+    plt.show()
+
+# Parte 4
+def relatorio_classificacao(model, dataloader, class_names, device='cpu'):
+    model = model.to(device)
+    model.eval()
+
+    all_preds = torch.tensor([], dtype=torch.long, device=device)
+    all_labels = torch.tensor([], dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+
+            all_preds = torch.cat((all_preds, preds), dim=0)
+            all_labels = torch.cat((all_labels, labels), dim=0)
+
+    report = metrics.classification_report(
+        all_labels.cpu().numpy(), all_preds.cpu().numpy(),
+        target_names=class_names, digits=4, zero_division=0
+    )
+
+    return report
+
+# Treinamento
+def train_modelo(model, dataloaders, optimizer, training_parameters, fold, date_now, device='cuda'):
+    since = time.time()
+
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_accuracy = 0.0
+    best_loss = float('inf')
+
+    train_loss_list = []
+    train_accuracy_list = []
+    val_loss_list = []
+    val_accuracy_list = []
+
+    model_type = training_parameters.get('model_type')
+    num_epochs = training_parameters.get('epochs')
+    batch_size = training_parameters.get('batch_size')
+
+    output_dir = r'outputs/' + model_type
+    os.makedirs(output_dir, exist_ok=True)
+
+    result_dir = output_dir + '\\' + model_type + '_' + date_now
+    os.makedirs(result_dir, exist_ok=True)
+
+    f = open(f'{result_dir}/{model_type}fold{fold}.txt', 'w')
+
+    for epoch in range(num_epochs):
+        f.write(f'Epoch {epoch}/{num_epochs - 1}\n')
+        f.write('-' * 10 + '\n')
+
+        print(f'Epoch {epoch}/{num_epochs - 1}')
+        print('-' * 10)
+
+        for phase in ['train', 'val']:
+            time_epoch_start = time.time()
+
+            if phase == 'train':
+                model.train()
+            else:
+                model.eval()
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            for inputs, labels in dataloaders[phase]:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                model.to(device)
+
+                optimizer.zero_grad()
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    if model_type == 'inception' and phase == 'train':
+                        outputs, aux_outputs = model(inputs)
+                        loss1 = training_parameters.get('criterion')(outputs, labels)
+                        loss2 = training_parameters.get('criterion')(aux_outputs, labels)
+                        loss = loss1 + 0.4 * loss2
+                    else:
+                        outputs = model(inputs)
+                        loss = training
+
+_parameters.get('criterion')(outputs, labels)
+
+                    _, preds = torch.max(outputs, 1)
+
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            epoch_loss = running_loss / len(dataloaders[phase].dataset)
+            epoch_accuracy = running_corrects.double() / len(dataloaders[phase].dataset)
+
+            time_epoch = time.time() - time_epoch_start
+
+            f.write(f'{phase.capitalize()} Loss: {epoch_loss:.4f} Acc: {epoch_accuracy:.4f} ({time_epoch:.4f} seconds) \n')
+
+            print(f'{phase.capitalize()} Loss: {epoch_loss:.4f} Acc: {epoch_accuracy:.4f} ({time_epoch:.4f} seconds)')
+
+            if phase == 'train':
+                train_loss_list.append(epoch_loss)
+                train_accuracy_list.append(epoch_accuracy)
+            else:
+                val_loss_list.append(epoch_loss)
+                val_accuracy_list.append(epoch_accuracy)
+
+            if phase == 'val' and epoch_loss < best_loss:
+                best_loss = epoch_loss
+                best_accuracy = epoch_accuracy
+                best_model_wts = copy.deepcopy(model.state_dict())
+
+        time_epoch = time.time() - since
+
+        f.write(f'Time: {time_epoch:.0f}s\n')
+        f.write('\n')
+
+        print(f'Time: {time_epoch:.0f}s')
+        print('\n')
+
+    time_elapsed = time.time() - since
+    f.write(f'Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s\n')
+    f.write(f'Number of epochs: {num_epochs}. Batch size: {batch_size}\n')
+    f.write(f'Best val loss: {best_loss:.4f} Best val acc: {best_accuracy:.4f}\n')
+
+    print(f'Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')
+    print(f'Best val loss: {best_loss:.4f} Best val acc: {best_accuracy:.4f}')
+
+    true_labels, predicted_labels = validacao_modelo(model, dataloaders['val'], device=device)
+    conf_matrix_val = metrics.confusion_matrix(true_labels, predicted_labels)
+    f.write(f'\nConfusion Matrix:\n{conf_matrix_val}\n')
+
+    class_report_val = relatorio_classificacao(model, dataloaders['val'], training_parameters.get('class_names'), device)
+    f.write(f'\nClassification report:\n{class_report_val}\n')
+
+    f.close()
+
+    plt.figure()
+    matriz_confusao(conf_matrix_val, classes=training_parameters.get('class_names'))
+    plt.savefig(f'{result_dir}/{model_type}fold{fold}_cf_mat.pdf')
+
+    matriz_perca_precisao(train_loss_list, val_loss_list, train_accuracy_list, val_accuracy_list, model_type, fold, result_dir)
+
+    model.load_state_dict(best_model_wts)
+    return model
+
+# Device
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(device)
+
+# Seed
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = True
+
+train_directory = "G:/data/dataset_treino"
+test_directory = "G:/data/dataset_teste"
+# Validação ^
+
+dataset_test = ImageFolder(test_directory)
+
+# Main
+def main_custom():
+    device_custom = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    print('\nDevice: {0}'.format(device_custom))
+    if torch.cuda.is_available():
+        print(torch.cuda.get_device_name(0))
+
+    for current_model_type in ['alexnet', 'efficient', 'resnet']:
+        print("***********************************************************************")
+        print(current_model_type)
+
+        basic_parameters = {
+            'num_classes': len(dataset.classes),
+            'class_names': dataset.classes,
+            'batch_size': 16,
+            'lr': 0.001,
+            'mm': 0.9,
+            'epochs': 20,
+            'current_model_type': current_model_type,
+            'criterion': nn.CrossEntropyLoss()
+        }
+
+        model_ft, input_size = initialize_model(current_model_type, basic_parameters['num_classes'])
+
+        data_transforms = {
+            'train': transforms.Compose([
+                transforms.Resize([input_size, input_size], antialias=True),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ]),
+            'val': transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Resize([input_size, input_size], antialias=True),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ]),
+        }
+
+        train_dataset = datasets.ImageFolder(train_dir, transform=data_transforms['train'])
+        test_dataset = datasets.ImageFolder(test_dir, transform=data_transforms['val'])
+
+        date_now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=basic_parameters['batch_size'], shuffle=True, num_workers=4)
+        val_loader = torch.utils.data.DataLoader(test_dataset, batch_size=basic_parameters['batch_size'], shuffle=True, num_workers=4)
+
+        dataloaders_dict = {'train': train_loader, 'val': val_loader}
+
+        optimizer = optim.SGD(model_ft.parameters(), lr=basic_parameters['lr'], momentum=basic_parameters['mm'])
+
+        train_model(model_ft, dataloaders_dict, optimizer, basic_parameters, 1, date_now, device)
+
+    for current_model_type in ['alexnet', 'efficient', 'resnet']:
+        print("***********************************************************************")
+        print(current_model_type)
+
+        training_parameters = {
+            'num_output_classes': len(dataset_test.classes),
+            'class_names': dataset_test.classes,
+            'batch_size': 16,
+            'learning_rate': 0.001,
+            'momentum': 0.9,
+            'epochs': 50,
+            'model_type': current_model_type,
+            'criterion': nn.CrossEntropyLoss()
+        }
+
+        modelo, input_dimension = Inicializacao_Modelo(current_model_type, training_parameters['num_output_classes'])
+
+        data_transforms_custom = {
+            'train': transforms.Compose([
+                transforms.Resize([input_dimension, input_dimension], antialias=True),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ]),
+            'val': transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Resize([input_dimension, input_dimension], antialias=True),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ]),
+        }
+
+        train_dataset_custom = datasets.ImageFolder(train_directory, transform=data_transforms_custom['train'])
+        test_dataset_custom = datasets.ImageFolder(test_directory, transform=data_transforms_custom['val'])
+
+        date_now_custom = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        train_loader_custom = torch.utils.data.DataLoader(train_dataset_custom, batch_size=training_parameters['batch_size'], shuffle=True, num_workers=4)
+        val_loader_custom = torch.utils.data.DataLoader(test_dataset_custom, batch_size=training_parameters['batch_size'], shuffle=True, num_workers=4)
+
+        dataloaders_dict_custom = {'train': train_loader_custom, 'val': val_loader_custom}
+
+        optimizer_custom = optim.SGD(modelo.parameters(), lr=training_parameters['learning_rate'], momentum=training_parameters['momentum'])
+
+        train_modelo(modelo, dataloaders_dict_custom, optimizer_custom, training_parameters, 1, date_now_custom, device_custom)
+
+    for current_model_type in ['alexnet', 'efficient', 'resnet']:
+        print("***********************************************************************")
+        print(current_model_type)
+
+        basic_parameters = {
+            'num_classes': len(dataset.classes),
+            'class_names': dataset.classes,
+            'batch_size': 16,
+            'lr': 0.001,
+            'mm': 0.9,
+            'epochs': 100,
+            'current_model_type': current_model_type,
+            'criterion': nn.CrossEntropyLoss()
+        }
+
+        model_ft, input_size = initialize_model(current_model_type, basic_parameters['num_classes'])
+
+        data_transforms = {
+            'train': transforms.Compose([
+                transforms.Resize([input_size, input_size], antialias=True),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ]),
+            'val': transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Resize([input_size, input_size], antialias=True),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ]),
+        }
+
+        train_dataset = datasets.ImageFolder(train_dir, transform=data_transforms['train'])
+        test_dataset = datasets.ImageFolder(test_dir, transform=data_transforms['val'])
+
+        date_now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=basic_parameters['batch_size'], shuffle=True, num_workers=4)
+        val_loader = torch.utils.data.DataLoader(test_dataset, batch_size=basic_parameters['batch_size'], shuffle=True, num_workers=4)
+
+        dataloaders_dict = {'train': train_loader, 'val': val_loader}
+
+        optimizer = optim.SGD(model_ft.parameters(), lr=basic_parameters['lr'], momentum=basic_parameters['mm'])
+
+        train_model(model_ft, dataloaders_dict, optimizer, basic_parameters, 1, date_now, device)
+
+if __name__ == "__main__":
+    main_custom()
